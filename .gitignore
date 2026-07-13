@@ -1,0 +1,61 @@
+build/
+  install/
+  log/
+
+  # CMake
+  cmake-build-*/
+  CMakeFiles/
+  CMakeCache.txt
+  Makefile
+  compile_commands.json
+
+  # C/C++ build products
+  *.o
+  *.obj
+  *.so
+  *.a
+  *.out
+
+  # Python
+  __pycache__/
+  *.py[cod]
+  .pytest_cache/
+  .venv/
+  venv/
+
+  # rosbag
+  *.bag
+  *.db3
+  *.db3-shm
+  *.db3-wal
+  *.mcap
+
+  # Video and large media
+  *.h264
+  *.h265
+  *.264
+  *.265
+  *.mp4
+  *.avi
+  *.mkv
+  *.yuv
+
+  # Logs and temporary files
+  *.log
+  *.tmp
+  *.swp
+  *~
+  .cache/
+
+  # IDE
+  .vscode/
+  .idea/
+
+  # OS
+  .DS_Store
+  Thumbs.db
+
+  # Credentials and secrets
+  .env
+  *.pem
+  *.key

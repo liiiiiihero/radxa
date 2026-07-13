@@ -1,0 +1,4 @@
+/home/radxa/v4l2_test/build/CMakeFiles/v4l2_video.dir
+/home/radxa/v4l2_test/build/CMakeFiles/v4l2_capture.dir
+/home/radxa/v4l2_test/build/CMakeFiles/edit_cache.dir
+/home/radxa/v4l2_test/build/CMakeFiles/rebuild_cache.dir
