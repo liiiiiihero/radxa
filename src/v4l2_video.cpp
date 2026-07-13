@@ -46,9 +46,9 @@ int xioctl(int fd, unsigned long request, void* arg) {
     return result;
 }
 
-uint32_t align_up(uint32_t value, uint32_t alignment) {
-    return (value + alignment - 1) & ~(alignment - 1);
-}
+// uint32_t align_up(uint32_t value, uint32_t alignment) {
+//     return (value + alignment - 1) & ~(alignment - 1);
+// }
 
 std::string fourcc_to_string(uint32_t value) {
     char text[5] = {
@@ -274,9 +274,10 @@ private:
         v4l2_format format{};
         format.type = type_;
         format.fmt.pix_mp.width = requested_width_;
-        // RK3588 MPP uses a 16-line aligned NV12 storage height. The valid
-        // image remains requested_height_ and is configured as the crop.
-        format.fmt.pix_mp.height = align_up(requested_height_, 16);
+        // Request the actual visible dimensions. Use the layout returned by
+        // the V4L2 driver directly for zero-copy MPP input.
+
+        format.fmt.pix_mp.height = requested_height_;
         format.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
         format.fmt.pix_mp.field = V4L2_FIELD_NONE;
 
@@ -306,17 +307,17 @@ private:
                 "V4L2 NV12 buffer is too small for its returned stride/height");
         vertical_stride_ = storage_height_;
 
-        v4l2_selection selection{};
-        selection.type = type_;
-        selection.target = V4L2_SEL_TGT_CROP;
-        selection.r.left = 0;
-        selection.r.top = 0;
-        selection.r.width = requested_width_;
-        selection.r.height = requested_height_;
-        if (xioctl(fd_, VIDIOC_S_SELECTION, &selection) < 0) {
-            std::cerr << "warning: VIDIOC_S_SELECTION crop failed: "
-                      << std::strerror(errno) << std::endl;
-        }
+        // v4l2_selection selection{};
+        // selection.type = type_;
+        // selection.target = V4L2_SEL_TGT_CROP;
+        // selection.r.left = 0;
+        // selection.r.top = 0;
+        // selection.r.width = requested_width_;
+        // selection.r.height = requested_height_;
+        // if (xioctl(fd_, VIDIOC_S_SELECTION, &selection) < 0) {
+        //     std::cerr << "warning: VIDIOC_S_SELECTION crop failed: "
+        //               << std::strerror(errno) << std::endl;
+        // }
 
         std::cout << "V4L2 format=NV12 planes=1 visible="
                   << requested_width_ << 'x' << requested_height_
@@ -664,7 +665,7 @@ int main(int argc, char** argv) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    std::string device = "/dev/video22";
+    std::string device = "/dev/video31";
     uint32_t width = 4000;
     uint32_t height = 3000;
     uint32_t fps = 30;
