@@ -9,6 +9,8 @@ cmake_minimum_required(VERSION 3.16)
   set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
   find_package(PkgConfig REQUIRED)
+  find_package(Threads REQUIRED)
+
   find_path(
       ROCKCHIP_MPP_INCLUDE_DIR
       NAMES rk_mpi.h
@@ -65,5 +67,6 @@ cmake_minimum_required(VERSION 3.16)
       PRIVATE
       PkgConfig::GSTREAMER
       ${ROCKCHIP_MPP_LIBRARY}
+      Threads::Threads
 
   )

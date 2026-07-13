@@ -15,21 +15,39 @@
 #include <rk_venc_cfg.h>
 
 #include <cerrno>
+#include <atomic>
 #include <chrono>
 #include <cctype>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <iostream>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <unordered_set>
+#include <utility>
 #include <vector>
+
 
 namespace {
 
-volatile sig_atomic_t running = 1;
+volatile sig_atomic_t signal_requested = 0;
+std::atomic_bool stop_requested{false};
+std::mutex output_mutex;
 
 void signal_handler(int) {
-    running = 0;
+    signal_requested = 1;
+}
+
+bool should_run() {
+    return signal_requested == 0 &&
+           !stop_requested.load(std::memory_order_relaxed);
 }
 
 void require(bool ok, const std::string& message) {
@@ -116,6 +134,7 @@ public:
     V4L2Capture(const std::string& device,
                 uint32_t width,
                 uint32_t height,
+                uint32_t fps,
                 uint32_t buffer_count)
         : requested_width_(width), requested_height_(height) {
         fd_ = open(device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
@@ -135,6 +154,7 @@ public:
                 "device does not support streaming I/O");
 
         configure_format();
+        configure_fps(fps);
         allocate_and_import_buffers(buffer_count);
         queue_all_buffers();
     }
@@ -176,7 +196,6 @@ public:
                 "VIDIOC_STREAMON failed: " +
                     std::string(std::strerror(errno)));
         streaming_ = true;
-        std::cout << "V4L2 stream started" << std::endl;
     }
 
     void stop() {
@@ -192,7 +211,7 @@ public:
     }
 
     bool dequeue(CapturedFrame& frame) {
-        while (running) {
+        while (should_run()) {
             pollfd descriptor{};
             descriptor.fd = fd_;
             descriptor.events = POLLIN;
@@ -274,9 +293,8 @@ private:
         v4l2_format format{};
         format.type = type_;
         format.fmt.pix_mp.width = requested_width_;
-        // Request the actual visible dimensions. Use the layout returned by
-        // the V4L2 driver directly for zero-copy MPP input.
-
+        // RK3588 MPP uses a 16-line aligned NV12 storage height. The valid
+        // image remains requested_height_ and is configured as the crop.
         format.fmt.pix_mp.height = requested_height_;
         format.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
         format.fmt.pix_mp.field = V4L2_FIELD_NONE;
@@ -323,6 +341,19 @@ private:
                   << requested_width_ << 'x' << requested_height_
                   << " storage=" << horizontal_stride_ << 'x' << vertical_stride_
                   << " sizeimage=" << size_image_ << std::endl;
+    }
+
+    void configure_fps(uint32_t fps) {
+        v4l2_streamparm parameter{};
+        parameter.type = type_;
+        parameter.parm.capture.timeperframe.numerator = 1;
+        parameter.parm.capture.timeperframe.denominator = fps;
+        if (xioctl(fd_, VIDIOC_S_PARM, &parameter) < 0) {
+            std::cerr << "warning: VIDIOC_S_PARM failed: "
+                      << std::strerror(errno)
+                      << "; application will pace/drop captured frames"
+                      << std::endl;
+        }
     }
 
     void allocate_and_import_buffers(uint32_t buffer_count) {
@@ -648,115 +679,186 @@ private:
     bool finished_ = false;
 };
 
-void print_usage(const char* program) {
-    std::cout << "usage:\n  " << program
-              << " [device] [width] [height] [fps] [duration_sec]"
-                 " [output.mp4] [bitrate_bps] [codec]\n\n"
-              << "codec:\n  h264 | h265 (default: h265)\n\n"
-              << "examples:\n  " << program
-              << " /dev/video31 4000 3000 30 60 h264.mp4 20000000 h264\n  "
-              << program
-              << " /dev/video31 4000 3000 30 60 h265.mp4 20000000 h265\n";
-}
+struct CameraSpec {
+    std::string device;
+    std::string output;
+};
 
-}  // namespace
-
-int main(int argc, char** argv) {
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-
-    std::string device = "/dev/video31";
+struct ProgramOptions {
     uint32_t width = 4000;
     uint32_t height = 3000;
     uint32_t fps = 30;
-    uint32_t duration_seconds = 30;
-    std::string output = "zero-copy.mp4";
+    uint32_t duration_seconds = 300;
     uint32_t bitrate = 20000000;
-    std::string codec_argument = "h265";
+    uint32_t buffer_count = 6;
+    VideoCodec codec = VideoCodec::H265;
+    std::vector<CameraSpec> cameras;
+};
 
-    try {
-        if (argc == 2 &&
-            (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help")) {
-            print_usage(argv[0]);
-            return 0;
+uint32_t parse_positive_u32(const std::string& text, const char* name) {
+    size_t consumed = 0;
+    const unsigned long value = std::stoul(text, &consumed);
+    require(consumed == text.size(), std::string("invalid ") + name + ": " + text);
+    require(value > 0 && value <= std::numeric_limits<uint32_t>::max(),
+            std::string(name) + " is out of range: " + text);
+    return static_cast<uint32_t>(value);
+}
+
+void validate_camera_specs(const std::vector<CameraSpec>& cameras) {
+    require(!cameras.empty(), "at least one --camera DEVICE OUTPUT is required");
+
+    std::unordered_set<std::string> devices;
+    std::unordered_set<std::string> outputs;
+    for (const CameraSpec& camera : cameras) {
+        require(devices.insert(camera.device).second,
+                "duplicate camera device: " + camera.device);
+        require(outputs.insert(camera.output).second,
+                "duplicate output file: " + camera.output);
+    }
+}
+
+ProgramOptions parse_arguments(int argc, char** argv) {
+    ProgramOptions options;
+
+    if (argc == 1) {
+        options.cameras.push_back(
+            {"/dev/video22", "camera22.mp4"}
+            
+        );
+
+        options.cameras.push_back(
+            {"/dev/video31", "camera31.mp4"}
+        );  
+        return options;
+
+    }
+
+    // Preserve the original single-camera positional command line.
+    if (argv[1][0] != '-') {
+        require(argc <= 9, "too many positional arguments; use --help for usage");
+
+        CameraSpec camera{argv[1], "zero-copy.mp4"};
+        if (argc >= 3) options.width = parse_positive_u32(argv[2], "width");
+        if (argc >= 4) options.height = parse_positive_u32(argv[3], "height");
+        if (argc >= 5) options.fps = parse_positive_u32(argv[4], "fps");
+        if (argc >= 6) {
+            options.duration_seconds =
+                parse_positive_u32(argv[5], "duration_sec");
         }
-        if (argc >= 2) device = argv[1];
-        if (argc >= 3) width = std::stoul(argv[2]);
-        if (argc >= 4) height = std::stoul(argv[3]);
-        if (argc >= 5) fps = std::stoul(argv[4]);
-        if (argc >= 6) duration_seconds = std::stoul(argv[5]);
-        if (argc >= 7) output = argv[6];
-        if (argc >= 8) bitrate = std::stoul(argv[7]);
-        if (argc >= 9) codec_argument = argv[8];
-        require(argc <= 9, "too many arguments; use --help for usage");
+        if (argc >= 7) camera.output = argv[6];
+        if (argc >= 8) {
+            options.bitrate = parse_positive_u32(argv[7], "bitrate_bps");
+        }
+        if (argc >= 9) options.codec = parse_codec(argv[8]);
+        options.cameras.push_back(std::move(camera));
+        return options;
+    }
 
-        require(width && height && fps && duration_seconds && bitrate,
-                "all numeric arguments must be positive");
-        const VideoCodec codec = parse_codec(codec_argument);
+    for (int index = 1; index < argc; ++index) {
+        const std::string argument = argv[index];
+        auto next_value = [&](const char* option) -> std::string {
+            require(index + 1 < argc,
+                    std::string("missing value after ") + option);
+            return argv[++index];
+        };
 
-        gst_init(&argc, &argv);
+        if (argument == "--camera") {
+            const std::string device = next_value("--camera");
+            const std::string output = next_value("--camera DEVICE");
+            options.cameras.push_back({device, output});
+        } else if (argument == "--width") {
+            options.width = parse_positive_u32(next_value("--width"), "width");
+        } else if (argument == "--height") {
+            options.height = parse_positive_u32(next_value("--height"), "height");
+        } else if (argument == "--fps") {
+            options.fps = parse_positive_u32(next_value("--fps"), "fps");
+        } else if (argument == "--duration") {
+            options.duration_seconds =
+                parse_positive_u32(next_value("--duration"), "duration");
+        } else if (argument == "--bitrate") {
+            options.bitrate =
+                parse_positive_u32(next_value("--bitrate"), "bitrate");
+        } else if (argument == "--buffers") {
+            options.buffer_count =
+                parse_positive_u32(next_value("--buffers"), "buffers");
+        } else if (argument == "--codec") {
+            options.codec = parse_codec(next_value("--codec"));
+        } else {
+            throw std::runtime_error("unknown option: " + argument);
+        }
+    }
 
-        V4L2Capture capture(device, width, height, 6);
-        MppVideoEncoder encoder(codec,
-                                capture.width(),
-                                capture.height(),
-                                capture.horizontal_stride(),
-                                capture.vertical_stride(),
-                                fps,
-                                bitrate);
-        Mp4Muxer muxer(codec, output, width, height, fps);
+    validate_camera_specs(options.cameras);
+    require(options.buffer_count >= 3, "--buffers must be at least 3");
+    return options;
+}
 
-        std::cout << "codec=" << codec_name(codec)
-                  << " bitrate=" << bitrate << " bps"
-                  << " target_fps=" << fps
-                  << " real_duration=" << duration_seconds << " sec"
-                  << std::endl;
+class CameraSession {
+public:
+    CameraSession(size_t index,
+                  CameraSpec camera,
+                  const ProgramOptions& options)
+        : index_(index),
+          camera_(std::move(camera)),
+          width_(options.width),
+          height_(options.height),
+          fps_(options.fps),
+          duration_seconds_(options.duration_seconds),
+          bitrate_(options.bitrate),
+          codec_(options.codec) {
+        capture_ = std::make_unique<V4L2Capture>(camera_.device,
+                                                 width_,
+                                                 height_,
+                                                 fps_,
+                                                 options.buffer_count);
+        encoder_ = std::make_unique<MppVideoEncoder>(
+            codec_,
+            capture_->width(),
+            capture_->height(),
+            capture_->horizontal_stride(),
+            capture_->vertical_stride(),
+            fps_,
+            bitrate_);
+        muxer_ = std::make_unique<Mp4Muxer>(
+            codec_, camera_.output, width_, height_, fps_);
+    }
 
-        // Start RKISP only after MPP and the MP4 muxing pipeline are ready.
-        // This prevents all V4L2 buffers from filling while downstream is
-        // still being initialized and makes the first capture timestamp the
-        // real start of the recording timeline.
-        capture.start();
+    CameraSession(const CameraSession&) = delete;
+    CameraSession& operator=(const CameraSession&) = delete;
+
+    void run() {
+        {
+            std::lock_guard<std::mutex> lock(output_mutex);
+            std::cout << prefix()
+                      << "codec=" << codec_name(codec_)
+                      << " bitrate=" << bitrate_ << " bps"
+                      << " target_fps=" << fps_
+                      << " real_duration=" << duration_seconds_ << " sec"
+                      << " output=" << camera_.output << std::endl;
+        }
+
+        capture_->start();
 
         const uint64_t target_frame_count =
-            static_cast<uint64_t>(fps) * duration_seconds;
+            static_cast<uint64_t>(fps_) * duration_seconds_;
         const int64_t target_duration_ns =
-            static_cast<int64_t>(duration_seconds) * 1000000000LL;
+            static_cast<int64_t>(duration_seconds_) * 1000000000LL;
 
         uint64_t captured_count = 0;
         uint64_t encoded_count = 0;
         uint64_t dropped_count = 0;
-        uint64_t last_timeline_frame = 0;
-        uint32_t first_v4l2_sequence = 0;
-        uint32_t last_v4l2_sequence = 0;
+        uint64_t next_timeline_frame = 0;
         int64_t first_capture_timestamp_ns = 0;
         int64_t last_capture_elapsed_ns = 0;
         bool timeline_started = false;
-        bool output_started = false;
-        bool sequence_started = false;
         auto recording_wall_start = std::chrono::steady_clock::now();
-        double dequeue_wait_ms_total = 0.0;
-        double encode_ms_total = 0.0;
-        double mux_ms_total = 0.0;
 
-        while (running) {
+        while (should_run()) {
             CapturedFrame captured;
-            const auto dequeue_start = std::chrono::steady_clock::now();
-            if (!capture.dequeue(captured)) {
+            if (!capture_->dequeue(captured)) {
                 break;
             }
-            const auto dequeue_end = std::chrono::steady_clock::now();
-            dequeue_wait_ms_total +=
-                std::chrono::duration<double, std::milli>(dequeue_end -
-                                                          dequeue_start)
-                    .count();
             ++captured_count;
-
-            if (!sequence_started) {
-                sequence_started = true;
-                first_v4l2_sequence = captured.sequence;
-            }
-            last_v4l2_sequence = captured.sequence;
 
             if (!timeline_started) {
                 require(captured.timestamp_ns > 0,
@@ -773,83 +875,66 @@ int main(int argc, char** argv) {
             last_capture_elapsed_ns = capture_elapsed_ns;
 
             if (capture_elapsed_ns >= target_duration_ns) {
-                capture.requeue(captured.index);
+                capture_->requeue(captured.index);
                 break;
             }
 
-            // Map every capture timestamp to its nearest output slot.  Using
-            // a "first frame at/after the deadline" policy loses valid slots
-            // when the source and target rates are close (for example a
-            // 27 FPS camera feeding a 25 FPS file): a frame just before a
-            // deadline is discarded and the next frame can cross the
-            // following deadline.  Nearest-slot mapping keeps the closest
-            // real camera sample while still preserving genuine source gaps.
-            const uint64_t timeline_frame = gst_util_uint64_scale_round(
-                static_cast<uint64_t>(capture_elapsed_ns),
-                fps,
-                GST_SECOND);
+            const uint64_t capture_timeline_frame = gst_util_uint64_scale(
+                static_cast<uint64_t>(capture_elapsed_ns), fps_, GST_SECOND);
 
-            // Rounding can map a capture just before the duration boundary to
-            // the first slot outside the requested interval.  Return it to
-            // V4L2 and keep reading until the real capture timeline reaches
-            // target_duration_ns.
-            if (timeline_frame >= target_frame_count) {
-                capture.requeue(captured.index);
+            // Preserve a real source/processing gap instead of encoding a
+            // burst of stale queued frames after this camera falls behind.
+            if (capture_timeline_frame > next_timeline_frame) {
+                next_timeline_frame = capture_timeline_frame;
+            }
+
+            if (next_timeline_frame >= target_frame_count) {
+                capture_->requeue(captured.index);
+                break;
+            }
+
+            const uint64_t next_frame_due_ns = gst_util_uint64_scale(
+                next_timeline_frame, GST_SECOND, fps_);
+            constexpr uint64_t timestamp_tolerance_ns = 1000000ULL;
+            if (static_cast<uint64_t>(capture_elapsed_ns) +
+                    timestamp_tolerance_ns <
+                next_frame_due_ns) {
+                capture_->requeue(captured.index);
                 ++dropped_count;
                 continue;
             }
 
-            // Keep at most one camera sample per output slot.  A jump of more
-            // than one slot is intentionally not filled with duplicates: the
-            // missing PTS positions describe real capture-rate shortfall.
-            if (output_started && timeline_frame <= last_timeline_frame) {
-                capture.requeue(captured.index);
-                ++dropped_count;
-                continue;
-            }
-
+            const uint64_t timeline_frame = next_timeline_frame;
             const int64_t pts_us = static_cast<int64_t>(
-                timeline_frame * 1000000ULL / fps);
+                timeline_frame * 1000000ULL / fps_);
 
             try {
-                const auto encode_start = std::chrono::steady_clock::now();
-                capture.prepare_for_mpp(captured.index);
-                std::vector<uint8_t> packet =
-                    encoder.encode(capture.mpp_buffer(captured.index), pts_us);
-                const auto encode_end = std::chrono::steady_clock::now();
-                encode_ms_total +=
-                    std::chrono::duration<double, std::milli>(encode_end -
-                                                              encode_start)
-                        .count();
-
-                const auto mux_start = std::chrono::steady_clock::now();
-                muxer.push(packet, timeline_frame);
-                const auto mux_end = std::chrono::steady_clock::now();
-                mux_ms_total +=
-                    std::chrono::duration<double, std::milli>(mux_end - mux_start)
-                        .count();
-                capture.requeue(captured.index);
+                capture_->prepare_for_mpp(captured.index);
+                std::vector<uint8_t> packet = encoder_->encode(
+                    capture_->mpp_buffer(captured.index), pts_us);
+                muxer_->push(packet, timeline_frame);
+                capture_->requeue(captured.index);
             } catch (...) {
-                capture.requeue(captured.index);
+                capture_->requeue(captured.index);
                 throw;
             }
 
-            output_started = true;
-            last_timeline_frame = timeline_frame;
+            next_timeline_frame = timeline_frame + 1;
             ++encoded_count;
-            if (encoded_count % fps == 0) {
-                std::cout << "captured=" << captured_count
+            if (encoded_count % fps_ == 0) {
+                std::lock_guard<std::mutex> lock(output_mutex);
+                std::cout << prefix()
+                          << "captured=" << captured_count
                           << " encoded=" << encoded_count
-                          << " dropped=" << dropped_count << '\r'
-                          << std::flush;
+                          << " dropped=" << dropped_count << std::endl;
             }
         }
 
         const auto recording_wall_end = std::chrono::steady_clock::now();
-        capture.stop();
+        capture_->stop();
 
         const auto finalize_start = std::chrono::steady_clock::now();
-        muxer.finish();
+        muxer_->finish();
         const auto finalize_end = std::chrono::steady_clock::now();
 
         const double recording_wall_seconds =
@@ -860,51 +945,144 @@ int main(int argc, char** argv) {
             static_cast<double>(last_capture_elapsed_ns) / 1000000000.0;
         const double finalize_seconds =
             std::chrono::duration<double>(finalize_end - finalize_start).count();
-        const double achieved_fps =
-            capture_timeline_seconds > 0.0
-                ? static_cast<double>(encoded_count) /
-                      capture_timeline_seconds
-                : 0.0;
-        const uint64_t missing_timeline_frames =
-            target_frame_count > encoded_count
-                ? target_frame_count - encoded_count
-                : 0;
-        const uint64_t v4l2_sequence_frames = sequence_started
-            ? static_cast<uint64_t>(
-                  static_cast<uint32_t>(last_v4l2_sequence -
-                                        first_v4l2_sequence)) +
-                  1
-            : 0;
-        const uint64_t v4l2_lost_frames =
-            v4l2_sequence_frames > captured_count
-                ? v4l2_sequence_frames - captured_count
-                : 0;
-        const double average_dequeue_wait_ms = captured_count
-            ? dequeue_wait_ms_total / static_cast<double>(captured_count)
-            : 0.0;
-        const double average_encode_ms = encoded_count
-            ? encode_ms_total / static_cast<double>(encoded_count)
-            : 0.0;
-        const double average_mux_ms = encoded_count
-            ? mux_ms_total / static_cast<double>(encoded_count)
-            : 0.0;
 
-        std::cout << "\ncaptured=" << captured_count
+        std::lock_guard<std::mutex> lock(output_mutex);
+        std::cout << prefix()
+                  << "captured=" << captured_count
                   << " encoded=" << encoded_count
                   << " dropped=" << dropped_count
-                  << " missing=" << missing_timeline_frames
-                  << " v4l2_lost=" << v4l2_lost_frames
-                  << "\ncapture_timeline=" << capture_timeline_seconds
-                  << " sec"
+                  << " capture_timeline=" << capture_timeline_seconds << " sec"
                   << " recording_wall=" << recording_wall_seconds << " sec"
                   << " finalize=" << finalize_seconds << " sec"
-                  << " target_fps=" << fps
-                  << " achieved_fps=" << achieved_fps
-                  << "\navg_dequeue_wait=" << average_dequeue_wait_ms << " ms"
-                  << " avg_encode=" << average_encode_ms << " ms"
-                  << " avg_mux=" << average_mux_ms << " ms"
-                  << "\nsaved " << output << std::endl;
-        return 0;
+                  << " output_fps=" << fps_
+                  << " saved=" << camera_.output << std::endl;
+    }
+
+    std::string prefix() const {
+        std::ostringstream stream;
+        stream << "[camera " << index_ << ' ' << camera_.device << "] ";
+        return stream.str();
+    }
+
+private:
+    size_t index_ = 0;
+    CameraSpec camera_;
+    uint32_t width_ = 0;
+    uint32_t height_ = 0;
+    uint32_t fps_ = 0;
+    uint32_t duration_seconds_ = 0;
+    uint32_t bitrate_ = 0;
+    VideoCodec codec_ = VideoCodec::H265;
+    std::unique_ptr<V4L2Capture> capture_;
+    std::unique_ptr<MppVideoEncoder> encoder_;
+    std::unique_ptr<Mp4Muxer> muxer_;
+};
+
+void print_usage(const char* program) {
+    std::cout
+        << "usage:\n"
+        << "  " << program
+        << " [device] [width] [height] [fps] [duration_sec]"
+           " [output.mp4] [bitrate_bps] [codec]\n\n"
+        << "  " << program
+        << " --camera DEVICE OUTPUT [--camera DEVICE OUTPUT ...]"
+           " [--width N] [--height N] [--fps N] [--duration N]"
+           " [--bitrate N] [--codec h264|h265] [--buffers N]\n\n"
+        << "examples:\n"
+        << "  " << program
+        << " /dev/video31 4000 3000 30 60 camera0.mp4 20000000 h265\n\n"
+        << "  " << program
+        << " --camera /dev/video31 camera0.mp4"
+           " --camera /dev/video41 camera1.mp4"
+           " --width 4000 --height 3000 --fps 30 --duration 60"
+           " --bitrate 20000000 --codec h265\n";
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    try {
+        if (argc == 2 &&
+            (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help")) {
+            print_usage(argv[0]);
+            return 0;
+        }
+
+        ProgramOptions options = parse_arguments(argc, argv);
+        validate_camera_specs(options.cameras);
+        require(options.buffer_count >= 3, "buffer count must be at least 3");
+
+        // Application options were already parsed above. Avoid asking
+        // GStreamer to interpret repeated --camera arguments.
+        gst_init(nullptr, nullptr);
+
+        std::vector<std::unique_ptr<CameraSession>> sessions;
+        sessions.reserve(options.cameras.size());
+        for (size_t index = 0; index < options.cameras.size(); ++index) {
+            {
+                std::lock_guard<std::mutex> lock(output_mutex);
+                std::cout << "preparing camera " << index << ": "
+                          << options.cameras[index].device << " -> "
+                          << options.cameras[index].output << std::endl;
+            }
+            sessions.push_back(std::make_unique<CameraSession>(
+                index, options.cameras[index], options));
+        }
+
+        std::mutex start_mutex;
+        std::condition_variable start_condition;
+        bool start_sessions = false;
+        std::vector<std::exception_ptr> errors(sessions.size());
+        std::vector<std::thread> workers;
+        workers.reserve(sessions.size());
+
+        for (size_t index = 0; index < sessions.size(); ++index) {
+            workers.emplace_back([&, index] {
+                {
+                    std::unique_lock<std::mutex> lock(start_mutex);
+                    start_condition.wait(lock, [&] { return start_sessions; });
+                }
+
+                try {
+                    sessions[index]->run();
+                } catch (...) {
+                    errors[index] = std::current_exception();
+                    stop_requested.store(true, std::memory_order_relaxed);
+                }
+            });
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(start_mutex);
+            start_sessions = true;
+        }
+        start_condition.notify_all();
+
+        for (std::thread& worker : workers) {
+            worker.join();
+        }
+
+        bool failed = false;
+        for (size_t index = 0; index < errors.size(); ++index) {
+            if (!errors[index]) {
+                continue;
+            }
+            failed = true;
+            try {
+                std::rethrow_exception(errors[index]);
+            } catch (const std::exception& error) {
+                std::cerr << sessions[index]->prefix()
+                          << "error: " << error.what() << std::endl;
+            } catch (...) {
+                std::cerr << sessions[index]->prefix()
+                          << "error: unknown exception" << std::endl;
+            }
+        }
+
+        return failed ? 1 : 0;
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << std::endl;
         return 1;

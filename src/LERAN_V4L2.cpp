@@ -46,9 +46,9 @@ int xioctl(int fd, unsigned long request, void* arg) {
     return result;
 }
 
-uint32_t align_up(uint32_t value, uint32_t alignment) {
-    return (value + alignment - 1) & ~(alignment - 1);
-}
+// uint32_t align_up(uint32_t value, uint32_t alignment) {
+//     return (value + alignment - 1) & ~(alignment - 1);
+// }
 
 std::string fourcc_to_string(uint32_t value) {
     char text[5] = {
@@ -116,7 +116,6 @@ public:
     V4L2Capture(const std::string& device,
                 uint32_t width,
                 uint32_t height,
-                uint32_t fps,
                 uint32_t buffer_count)
         : requested_width_(width), requested_height_(height) {
         fd_ = open(device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
@@ -136,7 +135,6 @@ public:
                 "device does not support streaming I/O");
 
         configure_format();
-        configure_fps(fps);
         allocate_and_import_buffers(buffer_count);
         queue_all_buffers();
     }
@@ -178,6 +176,7 @@ public:
                 "VIDIOC_STREAMON failed: " +
                     std::string(std::strerror(errno)));
         streaming_ = true;
+        std::cout << "V4L2 stream started" << std::endl;
     }
 
     void stop() {
@@ -275,9 +274,10 @@ private:
         v4l2_format format{};
         format.type = type_;
         format.fmt.pix_mp.width = requested_width_;
-        // RK3588 MPP uses a 16-line aligned NV12 storage height. The valid
-        // image remains requested_height_ and is configured as the crop.
-        format.fmt.pix_mp.height = align_up(requested_height_, 16);
+        // Request the actual visible dimensions. Use the layout returned by
+        // the V4L2 driver directly for zero-copy MPP input.
+
+        format.fmt.pix_mp.height = requested_height_;
         format.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
         format.fmt.pix_mp.field = V4L2_FIELD_NONE;
 
@@ -307,35 +307,22 @@ private:
                 "V4L2 NV12 buffer is too small for its returned stride/height");
         vertical_stride_ = storage_height_;
 
-        v4l2_selection selection{};
-        selection.type = type_;
-        selection.target = V4L2_SEL_TGT_CROP;
-        selection.r.left = 0;
-        selection.r.top = 0;
-        selection.r.width = requested_width_;
-        selection.r.height = requested_height_;
-        if (xioctl(fd_, VIDIOC_S_SELECTION, &selection) < 0) {
-            std::cerr << "warning: VIDIOC_S_SELECTION crop failed: "
-                      << std::strerror(errno) << std::endl;
-        }
+        // v4l2_selection selection{};
+        // selection.type = type_;
+        // selection.target = V4L2_SEL_TGT_CROP;
+        // selection.r.left = 0;
+        // selection.r.top = 0;
+        // selection.r.width = requested_width_;
+        // selection.r.height = requested_height_;
+        // if (xioctl(fd_, VIDIOC_S_SELECTION, &selection) < 0) {
+        //     std::cerr << "warning: VIDIOC_S_SELECTION crop failed: "
+        //               << std::strerror(errno) << std::endl;
+        // }
 
         std::cout << "V4L2 format=NV12 planes=1 visible="
                   << requested_width_ << 'x' << requested_height_
                   << " storage=" << horizontal_stride_ << 'x' << vertical_stride_
                   << " sizeimage=" << size_image_ << std::endl;
-    }
-
-    void configure_fps(uint32_t fps) {
-        v4l2_streamparm parameter{};
-        parameter.type = type_;
-        parameter.parm.capture.timeperframe.numerator = 1;
-        parameter.parm.capture.timeperframe.denominator = fps;
-        if (xioctl(fd_, VIDIOC_S_PARM, &parameter) < 0) {
-            std::cerr << "warning: VIDIOC_S_PARM failed: "
-                      << std::strerror(errno)
-                      << "; application will pace/drop captured frames"
-                      << std::endl;
-        }
     }
 
     void allocate_and_import_buffers(uint32_t buffer_count) {
@@ -682,7 +669,7 @@ int main(int argc, char** argv) {
     uint32_t width = 4000;
     uint32_t height = 3000;
     uint32_t fps = 30;
-    uint32_t duration_seconds = 10;
+    uint32_t duration_seconds = 30;
     std::string output = "zero-copy.mp4";
     uint32_t bitrate = 20000000;
     std::string codec_argument = "h265";
@@ -709,7 +696,7 @@ int main(int argc, char** argv) {
 
         gst_init(&argc, &argv);
 
-        V4L2Capture capture(device, width, height, fps, 6);
+        V4L2Capture capture(device, width, height, 6);
         MppVideoEncoder encoder(codec,
                                 capture.width(),
                                 capture.height(),
@@ -724,6 +711,11 @@ int main(int argc, char** argv) {
                   << " target_fps=" << fps
                   << " real_duration=" << duration_seconds << " sec"
                   << std::endl;
+
+        // Start RKISP only after MPP and the MP4 muxing pipeline are ready.
+        // This prevents all V4L2 buffers from filling while downstream is
+        // still being initialized and makes the first capture timestamp the
+        // real start of the recording timeline.
         capture.start();
 
         const uint64_t target_frame_count =
@@ -734,18 +726,37 @@ int main(int argc, char** argv) {
         uint64_t captured_count = 0;
         uint64_t encoded_count = 0;
         uint64_t dropped_count = 0;
-        uint64_t next_timeline_frame = 0;
+        uint64_t last_timeline_frame = 0;
+        uint32_t first_v4l2_sequence = 0;
+        uint32_t last_v4l2_sequence = 0;
         int64_t first_capture_timestamp_ns = 0;
         int64_t last_capture_elapsed_ns = 0;
         bool timeline_started = false;
+        bool output_started = false;
+        bool sequence_started = false;
         auto recording_wall_start = std::chrono::steady_clock::now();
+        double dequeue_wait_ms_total = 0.0;
+        double encode_ms_total = 0.0;
+        double mux_ms_total = 0.0;
 
         while (running) {
             CapturedFrame captured;
+            const auto dequeue_start = std::chrono::steady_clock::now();
             if (!capture.dequeue(captured)) {
                 break;
             }
+            const auto dequeue_end = std::chrono::steady_clock::now();
+            dequeue_wait_ms_total +=
+                std::chrono::duration<double, std::milli>(dequeue_end -
+                                                          dequeue_start)
+                    .count();
             ++captured_count;
+
+            if (!sequence_started) {
+                sequence_started = true;
+                first_v4l2_sequence = captured.sequence;
+            }
+            last_v4l2_sequence = captured.sequence;
 
             if (!timeline_started) {
                 require(captured.timestamp_ns > 0,
@@ -766,56 +777,65 @@ int main(int argc, char** argv) {
                 break;
             }
 
-            const uint64_t capture_timeline_frame = gst_util_uint64_scale(
+            // Map every capture timestamp to its nearest output slot.  Using
+            // a "first frame at/after the deadline" policy loses valid slots
+            // when the source and target rates are close (for example a
+            // 27 FPS camera feeding a 25 FPS file): a frame just before a
+            // deadline is discarded and the next frame can cross the
+            // following deadline.  Nearest-slot mapping keeps the closest
+            // real camera sample while still preserving genuine source gaps.
+            const uint64_t timeline_frame = gst_util_uint64_scale_round(
                 static_cast<uint64_t>(capture_elapsed_ns),
                 fps,
                 GST_SECOND);
 
-            // If processing was delayed, preserve that gap in the output
-            // timeline instead of encoding a burst of stale queued frames.
-            if (capture_timeline_frame > next_timeline_frame) {
-                next_timeline_frame = capture_timeline_frame;
-            }
-
-            if (next_timeline_frame >= target_frame_count) {
-                capture.requeue(captured.index);
-                break;
-            }
-
-            const uint64_t next_frame_due_ns = gst_util_uint64_scale(
-                next_timeline_frame,
-                GST_SECOND,
-                fps);
-            constexpr uint64_t timestamp_tolerance_ns = 1000000ULL;
-
-            // Keep at most one captured frame for each real-time output slot.
-            // For a 30 FPS source and a 10 FPS target this encodes one frame
-            // and immediately returns the other two buffers to RKISP.
-            if (static_cast<uint64_t>(capture_elapsed_ns) +
-                    timestamp_tolerance_ns <
-                next_frame_due_ns) {
+            // Rounding can map a capture just before the duration boundary to
+            // the first slot outside the requested interval.  Return it to
+            // V4L2 and keep reading until the real capture timeline reaches
+            // target_duration_ns.
+            if (timeline_frame >= target_frame_count) {
                 capture.requeue(captured.index);
                 ++dropped_count;
                 continue;
             }
 
-            const uint64_t timeline_frame = next_timeline_frame;
+            // Keep at most one camera sample per output slot.  A jump of more
+            // than one slot is intentionally not filled with duplicates: the
+            // missing PTS positions describe real capture-rate shortfall.
+            if (output_started && timeline_frame <= last_timeline_frame) {
+                capture.requeue(captured.index);
+                ++dropped_count;
+                continue;
+            }
 
             const int64_t pts_us = static_cast<int64_t>(
                 timeline_frame * 1000000ULL / fps);
 
             try {
+                const auto encode_start = std::chrono::steady_clock::now();
                 capture.prepare_for_mpp(captured.index);
                 std::vector<uint8_t> packet =
                     encoder.encode(capture.mpp_buffer(captured.index), pts_us);
+                const auto encode_end = std::chrono::steady_clock::now();
+                encode_ms_total +=
+                    std::chrono::duration<double, std::milli>(encode_end -
+                                                              encode_start)
+                        .count();
+
+                const auto mux_start = std::chrono::steady_clock::now();
                 muxer.push(packet, timeline_frame);
+                const auto mux_end = std::chrono::steady_clock::now();
+                mux_ms_total +=
+                    std::chrono::duration<double, std::milli>(mux_end - mux_start)
+                        .count();
                 capture.requeue(captured.index);
             } catch (...) {
                 capture.requeue(captured.index);
                 throw;
             }
 
-            next_timeline_frame = timeline_frame + 1;
+            output_started = true;
+            last_timeline_frame = timeline_frame;
             ++encoded_count;
             if (encoded_count % fps == 0) {
                 std::cout << "captured=" << captured_count
@@ -840,15 +860,49 @@ int main(int argc, char** argv) {
             static_cast<double>(last_capture_elapsed_ns) / 1000000000.0;
         const double finalize_seconds =
             std::chrono::duration<double>(finalize_end - finalize_start).count();
+        const double achieved_fps =
+            capture_timeline_seconds > 0.0
+                ? static_cast<double>(encoded_count) /
+                      capture_timeline_seconds
+                : 0.0;
+        const uint64_t missing_timeline_frames =
+            target_frame_count > encoded_count
+                ? target_frame_count - encoded_count
+                : 0;
+        const uint64_t v4l2_sequence_frames = sequence_started
+            ? static_cast<uint64_t>(
+                  static_cast<uint32_t>(last_v4l2_sequence -
+                                        first_v4l2_sequence)) +
+                  1
+            : 0;
+        const uint64_t v4l2_lost_frames =
+            v4l2_sequence_frames > captured_count
+                ? v4l2_sequence_frames - captured_count
+                : 0;
+        const double average_dequeue_wait_ms = captured_count
+            ? dequeue_wait_ms_total / static_cast<double>(captured_count)
+            : 0.0;
+        const double average_encode_ms = encoded_count
+            ? encode_ms_total / static_cast<double>(encoded_count)
+            : 0.0;
+        const double average_mux_ms = encoded_count
+            ? mux_ms_total / static_cast<double>(encoded_count)
+            : 0.0;
 
         std::cout << "\ncaptured=" << captured_count
                   << " encoded=" << encoded_count
                   << " dropped=" << dropped_count
+                  << " missing=" << missing_timeline_frames
+                  << " v4l2_lost=" << v4l2_lost_frames
                   << "\ncapture_timeline=" << capture_timeline_seconds
                   << " sec"
                   << " recording_wall=" << recording_wall_seconds << " sec"
                   << " finalize=" << finalize_seconds << " sec"
-                  << " output_fps=" << fps
+                  << " target_fps=" << fps
+                  << " achieved_fps=" << achieved_fps
+                  << "\navg_dequeue_wait=" << average_dequeue_wait_ms << " ms"
+                  << " avg_encode=" << average_encode_ms << " ms"
+                  << " avg_mux=" << average_mux_ms << " ms"
                   << "\nsaved " << output << std::endl;
         return 0;
     } catch (const std::exception& error) {
