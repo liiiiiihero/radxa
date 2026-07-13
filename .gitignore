@@ -59,3 +59,9 @@ build/
   .env
   *.pem
   *.key
+  # Raw camera dump
+  *.raw
+  *.rgb
+  *.nv12
+  *.nv21
+  *.yuv

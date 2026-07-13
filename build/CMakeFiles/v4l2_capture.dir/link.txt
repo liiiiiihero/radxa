@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/v4l2_capture.dir/src/v4l2_capture.cpp.o -o v4l2_capture 
