@@ -56,7 +56,8 @@ namespace
     std::atomic_bool stop_requested{false};
     std::mutex output_mutex;
 
-    void signal_handler(int) {
+    void signal_handler(int) 
+    {
         signal_requested = 1;
     }
 
@@ -83,9 +84,7 @@ namespace
         return result;
     }
 
-    // uint32_t align_up(uint32_t value, uint32_t alignment) {
-    //     return (value + alignment - 1) & ~(alignment - 1);
-    // }
+ 
 
     std::string fourcc_to_string(uint32_t value) 
     {
@@ -112,18 +111,16 @@ namespace
                 std::tolower(static_cast<unsigned char>(character)));
         }
 
-        if (value == "h264" || value == "avc") 
-        {
+        if (value == "h264" || value == "avc") {
             return VideoCodec::H264;
         }
-        if (value == "h265" || value == "hevc") 
-        {
+        if (value == "h265" || value == "hevc") {
             return VideoCodec::H265;
         }
         throw std::runtime_error(
             "invalid codec '" + value + "' (expected h264 or h265)");
-    }
-
+    }   
+    
     const char* codec_name(VideoCodec codec) 
     {
         return codec == VideoCodec::H264 ? "h264" : "h265";
@@ -143,6 +140,8 @@ namespace
     {
         return codec == VideoCodec::H264 ? "video/x-h264" : "video/x-h265";
     }
+
+
 
     struct CaptureBuffer 
     {
@@ -186,11 +185,9 @@ namespace
                 caps = capability.device_caps;
             }
             //查询是否支持多平面采集能力
-            require(caps & V4L2_CAP_VIDEO_CAPTURE_MPLANE,
-                    "device does not support multiplanar capture");
+            require(caps & V4L2_CAP_VIDEO_CAPTURE_MPLANE,"device does not support multiplanar capture");
             //检查是否支持Streaming
-            require(caps & V4L2_CAP_STREAMING,
-                    "device does not support streaming I/O");
+            require(caps & V4L2_CAP_STREAMING, "device does not support streaming I/O");
             //配置图像格式 
             configure_format();
             //配置fps
@@ -298,16 +295,12 @@ namespace
                     frame.index = buffer.index;
                     frame.sequence = buffer.sequence;
                     //转换成ns 固定
-                    frame.timestamp_ns =
-                        static_cast<int64_t>(buffer.timestamp.tv_sec) *
-                            1000000000LL +
-                        static_cast<int64_t>(buffer.timestamp.tv_usec) * 1000LL;
+                    frame.timestamp_ns = static_cast<int64_t>(buffer.timestamp.tv_sec) * 1000000000LL + static_cast<int64_t>(buffer.timestamp.tv_usec) * 1000LL;
                     return true;
                 }
                 if (errno != EAGAIN && errno != EINTR) 
                 {
-                    throw std::runtime_error("VIDIOC_DQBUF failed: " +
-                                            std::string(std::strerror(errno)));
+                    throw std::runtime_error("VIDIOC_DQBUF failed: " + std::string(std::strerror(errno)));
                 }
             }
             return false;
@@ -325,16 +318,13 @@ namespace
             buffer.length = 1;
             buffer.m.planes = planes;
 
-            require(xioctl(fd_, VIDIOC_QBUF, &buffer) == 0,
-                    "VIDIOC_QBUF failed: " + std::string(std::strerror(errno)));
+            require(xioctl(fd_, VIDIOC_QBUF, &buffer) == 0,"VIDIOC_QBUF failed: " + std::string(std::strerror(errno)));
         }
-
         MppBuffer mpp_buffer(uint32_t index) const 
         {
             require(index < buffers_.size(), "invalid V4L2 buffer index");
             return buffers_[index].mpp_buffer;
         }
-
         void prepare_for_mpp(uint32_t index) const 
         {
             require(index < buffers_.size(), "invalid V4L2 buffer index");
@@ -351,11 +341,9 @@ namespace
         uint32_t vertical_stride() const { return vertical_stride_; }
         uint32_t storage_height() const { return storage_height_; }
         uint32_t size_image() const { return size_image_; }
-
     private:
         void configure_format() 
         {
-            
             v4l2_format format{};
             format.type = type_;
             format.fmt.pix_mp.width = requested_width_;
@@ -364,36 +352,19 @@ namespace
             format.fmt.pix_mp.height = requested_height_;
             format.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
             format.fmt.pix_mp.field = V4L2_FIELD_NONE;
-
-            require(xioctl(fd_, VIDIOC_S_FMT, &format) == 0,
-                    "VIDIOC_S_FMT NV12 failed: " +
-                        std::string(std::strerror(errno)));
-            require(format.fmt.pix_mp.pixelformat == V4L2_PIX_FMT_NV12,
-                    "driver changed NV12 to " +
-                        fourcc_to_string(format.fmt.pix_mp.pixelformat));
-            require(format.fmt.pix_mp.num_planes == 1,
-                    "single-plane NV12 required, driver returned " +
-                        std::to_string(format.fmt.pix_mp.num_planes) + " planes");
-            require(format.fmt.pix_mp.width == requested_width_,
-                    "driver changed capture width to " +
-                        std::to_string(format.fmt.pix_mp.width));
-            require(format.fmt.pix_mp.height >= requested_height_,
-                    "driver returned a capture height smaller than requested");
-
+            require(xioctl(fd_, VIDIOC_S_FMT, &format) == 0, "VIDIOC_S_FMT NV12 failed: " + std::string(std::strerror(errno)));
+            require(format.fmt.pix_mp.pixelformat == V4L2_PIX_FMT_NV12,"driver changed NV12 to " + fourcc_to_string(format.fmt.pix_mp.pixelformat));
+            require(format.fmt.pix_mp.num_planes == 1,"single-plane NV12 required, driver returned " + std::to_string(format.fmt.pix_mp.num_planes) + " planes");
+            require(format.fmt.pix_mp.width == requested_width_,"driver changed capture width to " + std::to_string(format.fmt.pix_mp.width));
+            require(format.fmt.pix_mp.height >= requested_height_,"driver returned a capture height smaller than requested");
             storage_height_ = format.fmt.pix_mp.height;
             //保存驱动返回的真实行跨度。
             horizontal_stride_ = format.fmt.pix_mp.plane_fmt[0].bytesperline;
-
             size_image_ = format.fmt.pix_mp.plane_fmt[0].sizeimage;
-
             require(horizontal_stride_ >= requested_width_, "invalid NV12 stride");
-
-            const uint64_t minimum_size =
-                static_cast<uint64_t>(horizontal_stride_) * storage_height_ * 3 / 2;
-            require(size_image_ >= minimum_size,
-                    "V4L2 NV12 buffer is too small for its returned stride/height");
+            const uint64_t minimum_size = static_cast<uint64_t>(horizontal_stride_) * storage_height_ * 3 / 2;
+            require(size_image_ >= minimum_size,"V4L2 NV12 buffer is too small for its returned stride/height");
             vertical_stride_ = storage_height_;
-
             std::cout << "V4L2 format=NV12 planes=1 visible="
                     << requested_width_ << 'x' << requested_height_
                     << " storage=" << horizontal_stride_ << 'x' << vertical_stride_
@@ -421,8 +392,7 @@ namespace
             request.count = buffer_count;
             request.type = type_;
             request.memory = V4L2_MEMORY_MMAP;
-            require(xioctl(fd_, VIDIOC_REQBUFS, &request) == 0,
-                    "VIDIOC_REQBUFS failed: " + std::string(std::strerror(errno)));
+            require(xioctl(fd_, VIDIOC_REQBUFS, &request) == 0, "VIDIOC_REQBUFS failed: " + std::string(std::strerror(errno)));
             require(request.count >= 3, "V4L2 allocated too few capture buffers");
 
             buffers_.resize(request.count);
@@ -735,8 +705,8 @@ namespace
         uint32_t height = 3000;
         uint32_t fps = 30;
         uint32_t duration_seconds = 300;
-        uint32_t bitrate = 20000000;
-        uint32_t buffer_count = 6;
+        uint32_t bitrate = 12000000;
+        uint32_t buffer_count = 12;
         VideoCodec codec = VideoCodec::H265;
         std::vector<CameraSpec> cameras;
     };
@@ -772,7 +742,6 @@ namespace
         if (argc == 1) 
         {
             options.cameras.push_back({"/dev/video22", "camera22.mp4"});
-
             options.cameras.push_back({"/dev/video31", "camera31.mp4"});  
             return options;
 
@@ -789,8 +758,7 @@ namespace
             if (argc >= 5) options.fps = parse_positive_u32(argv[4], "fps");
             if (argc >= 6) 
             {
-                options.duration_seconds =
-                    parse_positive_u32(argv[5], "duration_sec");
+                options.duration_seconds = parse_positive_u32(argv[5], "duration_sec");
             }
             if (argc >= 7) camera.output = argv[6];
             if (argc >= 8) 
@@ -807,8 +775,7 @@ namespace
             const std::string argument = argv[index];
             auto next_value = [&](const char* option) -> std::string 
             {
-                require(index + 1 < argc,
-                        std::string("missing value after ") + option);
+                require(index + 1 < argc, std::string("missing value after ") + option);
                 return argv[++index];
             };
 
@@ -874,7 +841,7 @@ namespace
             bitrate_(options.bitrate),
             codec_(options.codec) 
             {
-                //创建采集器 创建一个由 智能指针capture_ 独占管理的 V4L2Capture 对象  函数销毁 智能指针自动销毁
+                //创建采集器 创建一个由 智能指针capture_ 独占管理的 V4L2Capture对象  函数销毁 智能指针自动销毁
                 capture_ = std::make_unique<V4L2Capture>(
                     camera_.device,
                     width_,
@@ -897,10 +864,9 @@ namespace
                     width_, height_, 
                     fps_);
         }
-        
+        //禁止复制
         CameraSession(const CameraSession&) = delete;
         CameraSession& operator=(const CameraSession&) = delete;
-
         void run() 
         {
             //日志锁
@@ -917,10 +883,8 @@ namespace
             //缓冲已准备 开始采集
             capture_->start();
             
-            const uint64_t target_frame_count =
-                static_cast<uint64_t>(fps_) * duration_seconds_;
-            const int64_t target_duration_ns =
-                static_cast<int64_t>(duration_seconds_) * 1000000000LL;
+            const uint64_t target_frame_count = static_cast<uint64_t>(fps_) * duration_seconds_;
+            const int64_t target_duration_ns  = static_cast<int64_t>(duration_seconds_) * 1000000000LL;
 
             uint64_t captured_count = 0;
             uint64_t encoded_count = 0;
